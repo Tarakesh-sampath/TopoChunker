@@ -3,6 +3,7 @@ outputs/
 models/
 Evaluation/
 demo/
+utils/
 *.json
 *.txt
 
