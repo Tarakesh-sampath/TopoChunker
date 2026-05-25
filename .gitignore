@@ -1,9 +1,15 @@
+config/llm_config.json
+__pycache__/
+*.pyc
+outputs/
+
 # Output files
 outputs/
 models/
 Evaluation/
 demo/
 utils/
+figure/
 *.json
 *.txt
 

@@ -27,7 +27,7 @@ class RefinerAgent:
         self.verbose = verbose
         
         # --- 优化 A: 预初始化工具并绑定 LLM，避免每轮重复开销 ---
-        self.tools = get_refiner_tools(self.node_registry, self.splitter_func)
+        self.tools = get_refiner_tools(self.node_registry, self.splitter_func, llm=self.base_llm)
         self.llm_with_tools = self.base_llm.bind_tools(self.tools)
         
         self.workflow = self._build_workflow()
@@ -135,9 +135,9 @@ class RefinerAgent:
 
             full_node_text = _get_full_text(root_node)
             # 只有当节点 ≤ 2000 tokens 时，才注入完整内容
-            # 对于 > 2000 tokens 的节点，不注入内容，要求先调用 semantic_split_content 切分
+            # 对于 > 2000 tokens 的节点，不注入内容，要求先调用 Semantic_Slicer 切分
             if root_node.total_tree_token > 2000:
-                node_content_brief = f"(This node has {root_node.total_tree_token} tokens. You MUST call `semantic_split_content` tool FIRST to split it. DO NOT use `preview_node_content` tool for large nodes.)"
+                node_content_brief = f"(This node has {root_node.total_tree_token} tokens. You MUST call `Semantic_Slicer` tool FIRST to split it.)"
             else:
                 node_content_brief = full_node_text
 
@@ -193,14 +193,12 @@ Your task is to organize document sections into **Self-Contained** chunks optimi
 #### **STEP 3: RESOLVE (回溯)**
 * **ONLY trigger if**: A pronoun/reference cannot be resolved within the current chunk.
 * **Process**:
-    1. Call `get_previous_node_content(node_id="<current_node_id>")` to get the 1st previous chunk. Replace `<current_node_id>` with the actual node ID you're processing.
+    1. Call `SIR_Query(node_id="<current_node_id>", include_lineage=true, include_entity_definitions=true)` to get previous sibling + topological lineage context. Replace `<current_node_id>` with the actual node ID you're processing.
     2. Search the 1st previous chunk content for the referent.
     3. **If found**: Include "Context Supplement" field mapping the pronoun to the referent (e.g., `"Context Supplement": "'Him' refers to Jim."`). STOP.
-    4. **If NOT found**: Call `get_previous_nodes(node_id="<current_node_id>", count=2)` to get BOTH the 1st and 2nd previous chunks. Replace `<current_node_id>` with the actual node ID.
-    5. Check the 2nd previous chunk (the second item in the returned list) for the referent.
-    6. **If found**: Include "Context Supplement" field mapping the pronoun to the referent.
-    7. **If still NOT found**: **DO NOT include "Context Supplement" field at all** (omit it entirely).
-* **Maximum backtracking**: 2 previous chunks only. If still unresolved after checking 2 previous chunks, omit "Context Supplement" field entirely.
+    4. If unresolved, re-check `SIR_Query` output (`lineage` and `definition_candidates`) and only add Context Supplement when evidence exists.
+    5. **If still NOT found**: **DO NOT include "Context Supplement" field at all** (omit it entirely).
+* Use only `SIR_Query` for backtracking and lineage evidence.
 
 ---
 
@@ -290,9 +288,9 @@ Tom Sawyer said hello.
 4.  Return as **ONE string** in the list.
 
 **Case B: Large Nodes (> 2000 tokens)**
-* **CRITICAL STEP**: You **MUST** call the `semantic_split_content` tool FIRST.
+* **CRITICAL STEP**: You **MUST** call the `Semantic_Slicer` tool FIRST.
 * **Process**: For EACH resulting segment returned by the tool:
-    1.  Generate a unique Title based on that segment's specific content.
+    1.  Call `Chunk_Enhancer` to generate a unique semantic signature title.
     2.  Conditionally create a Context Supplement specific to *that segment* - **ONLY if needed** (follow 3-step resolution process).
     3.  Output the **original content** of that segment.
 * **Output**: A list of multiple strings (one per segment). **DO NOT merge them back.**
@@ -347,30 +345,28 @@ Current Node ID: `{root_node.node_id}`
   - If NO → Proceed to STEP 3
 
 **STEP 3: RESOLVE** (only if referent NOT in current chunk):
-  1. Call `get_previous_node_content(node_id="{root_node.node_id}")` to get 1st previous chunk
-  2. Search 1st previous chunk for referent
+  1. Call `SIR_Query(node_id="{root_node.node_id}", include_lineage=true, include_entity_definitions=true)` to get previous sibling + lineage context
+  2. Search `previous_sibling.content` and `definition_candidates` for referent
   3. If found → Include "Context Supplement" field with mapping (e.g., "'Him' refers to Jim.") → STOP
-  4. If NOT found → Call `get_previous_nodes(node_id="{root_node.node_id}", count=2)` to get both 1st and 2nd previous chunks
-  5. Check the 2nd previous chunk (second item in returned list) for referent
-  6. If found → Include "Context Supplement" field with mapping → STOP
-  7. If still NOT found → DO NOT include "Context Supplement" field at all
+  4. If NOT found → Re-check `lineage` and `definition_candidates` from SIR_Query
+  5. If still NOT found → DO NOT include "Context Supplement" field at all
 
 **CRITICAL REMINDERS**: 
 - Default: DO NOT include "Context Supplement" field (assume chunk is clear)
 - Only include "Context Supplement" field when pronoun CANNOT be resolved in current chunk BUT IS found in previous chunk(s)
-- Maximum backtracking: 2 previous chunks only
+- Use only `SIR_Query`, no other backtracking tools
 - DO NOT write redundant information already in the chunk
 - DO NOT write global document metadata (author, book title, etc.)
 """
             
             if root_node.total_tree_token > 2000:
-                task_instruction = f"CRITICAL: This node has {root_node.total_tree_token} tokens (> 2000). You MUST:\n1. Call `semantic_split_content` tool FIRST to split it into multiple segments.\n2. Output MULTIPLE chunks (one per segment), NOT a single merged chunk.\n3. For EACH segment: (a) Generate a unique title, (b) Follow the 3-step resolution process for Context Supplement (scan → internal check → resolve with tools if needed), (c) Output the original content VERBATIM without any changes.\n\n{tool_usage_guide}\n\n[Full Node Content to Process]:\n{node_content_brief}"
+                task_instruction = f"CRITICAL: This node has {root_node.total_tree_token} tokens (> 2000). You MUST:\n1. Call `Semantic_Slicer` tool FIRST to split it into multiple segments.\n2. Output MULTIPLE chunks (one per segment), NOT a single merged chunk.\n3. For EACH segment: (a) Call `Chunk_Enhancer` to generate title, (b) Follow the 3-step resolution process for Context Supplement (scan → internal check → resolve with SIR_Query), (c) Output the original content VERBATIM without any changes.\n\n{tool_usage_guide}\n\n[Full Node Content to Process]:\n{node_content_brief}"
             elif is_placeholder_title:
                 # 特殊处理：如果是占位符标题，强制要求生成新标题
                 # CRITICAL: 内容中可能包含 "Document Root" 占位符，必须忽略它，只处理实际内容
                 task_instruction = f"SPECIAL CASE: This node has a placeholder title ('{root_node.content}').\n\nCRITICAL INSTRUCTIONS:\n1. IGNORE any placeholder text like 'Document Root', 'Root', etc. in the content\n2. Generate a simple, clear title based on the ACTUAL CONTENT (Strategy 1)\n3. Follow the 3-step resolution process for Context Supplement:\n   - SCAN for pronouns/references\n   - INTERNAL CHECK if referent exists in current chunk\n   - RESOLVE by calling tools if needed (max 2 previous chunks)\n4. Output the original content VERBATIM without any changes (Strategy 3)\n5. Output format: <final_chunks>[\"# Title\\n\\n\\\"Context Supplement\\\": \\\"...\\\"\\n\\nOriginal content verbatim\"]</final_chunks>\n\n{tool_usage_guide}\n\n[Full Node Content to Process]:\n{node_content_brief}\n\nREMEMBER: Do NOT include 'Document Root' or any placeholder text in your output! Do NOT modify the original text!"
             else:
-                task_instruction = f"This node has {root_node.total_tree_token} tokens (≤ 2000). Do NOT split. You MUST:\n1. Generate a concise title based on content (Strategy 1).\n2. Follow the 3-step resolution process for Context Supplement:\n   - SCAN for pronouns/references in current chunk\n   - INTERNAL CHECK if referent exists in current chunk\n   - RESOLVE by calling `get_previous_node_content` or `get_previous_nodes` tools if needed (max 2 previous chunks)\n3. Output the original content VERBATIM without any changes (Strategy 3).\n4. Output as ONE chunk.\n\n{tool_usage_guide}\n\n[Full Node Content to Process]:\n{node_content_brief}"
+                task_instruction = f"This node has {root_node.total_tree_token} tokens (≤ 2000). Do NOT split. You MUST:\n1. Call `Chunk_Enhancer` to generate a concise title based on content (Strategy 1).\n2. Follow the 3-step resolution process for Context Supplement:\n   - SCAN for pronouns/references in current chunk\n   - INTERNAL CHECK if referent exists in current chunk\n   - RESOLVE by calling `SIR_Query` (previous sibling + lineage)\n3. Output the original content VERBATIM without any changes (Strategy 3).\n4. Output as ONE chunk.\n\n{tool_usage_guide}\n\n[Full Node Content to Process]:\n{node_content_brief}"
             
             init_msgs = [
                 SystemMessage(content=system_prompt), 

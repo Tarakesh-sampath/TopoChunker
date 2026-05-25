@@ -1,263 +1,434 @@
 """
-LLM-based Semantic Chunker (Lumber Sentence Style)
+LLM-based Semantic Chunker (ID-Based Deterministic Pipeline)
 
-复刻 LumberChunker 的核心逻辑，改为句子版：
-1. 预处理：将文本拆成带编号的句子 [S 0], [S 1], ...
-2. 积攒：从当前位置往后凑够 threshold tokens
-3. 判决：带编号的句子发给 LLM，让 LLM 返回切分点的句子 ID
-4. 切分：根据 LLM 返回的 ID 切下前半部分为 Chunk
-5. 移动指针：从切分点继续下一轮
+四阶段流水线（Four-Stage Pipeline）：
 
-关键设计（复刻 LumberChunker 动态长度）：
-- NO_SPLIT 时不立即归档，而是继续积攒更多句子，直到 max_tokens 才强制切
-- 这样保证了 chunk 长度是动态的，而非固定长度
+    [Stage 1] 边界标定（Regex Segmentation）
+        ├─ 用正则在中英文标点处切句
+        └─ 为每条句子分配全局 ID  →  [S0] [S1] [S2] ...
+
+    [Stage 2] LLM 决策（Boundary Proposal）
+        ├─ 在带 ID 的窗口内询问 LLM
+        └─ LLM 仅返回主题切换的 ID（可单个或多个），或 "NO_SPLIT"
+
+    [Stage 3] 确定性校验（Deterministic Validation）
+        ├─ 解析合法性     —— 必须能从输出中抽取出整数 ID
+        ├─ 范围合法性     —— 0 < id < 窗口句子数
+        ├─ 最小占位检查   —— 切下的前缀不少于 min_chunk_tokens
+        ├─ 最大占位检查   —— 切下的前缀不超过 max_chunk_tokens（超出则自动回退）
+        └─ 重复/单调性检查 —— 多 ID 时去重、排序、过滤过近边界
+
+    [Stage 4] 执行切分（Execute）
+        └─ 按已校验 ID 切分；NO_SPLIT 或全部不通过 → 继续积攒/到达硬上限强切
+
+LumberChunker 风格：NO_SPLIT 时不立即归档，而是继续往后积攒，直到 max_tokens 才强制切。
 """
 
 import re
-from typing import List, Union
-from langchain_core.messages import HumanMessage, SystemMessage
+from dataclasses import dataclass, field
+from typing import List, Optional, Union
+
 from langchain_core.language_models import BaseChatModel
+from langchain_core.messages import HumanMessage, SystemMessage
+
 from agents.llm_factory import create_llm
 
-# === 复刻 LumberChunker 的 Prompt (改为句子版) ===
-SYSTEM_PROMPT = """
-You will receive a text comprised of numbered sentences (e.g., [S 0], [S 1]...).
+# =====================================================================
+# Prompt：要求 LLM 仅输出 ID（支持单/多 ID），或 NO_SPLIT
+# =====================================================================
+SYSTEM_PROMPT = """\
+You will receive a text comprised of numbered sentences in the form [S0] [S1] [S2] ...
 
 **Task:**
-Identify the **FIRST sentence ID** (starting from [S 1], do **NOT** pick [S 0]) where the topic, scene, or time shifts **drastically** compared to the sentences before it.
+Identify the **sentence ID(s)** where the topic, scene, or time shifts **drastically** compared
+to the sentences before it. Each ID you return marks the FIRST sentence of a new chunk.
 
 **Rules:**
-1. **NOT THE FIRST ONE:** Do not select [S 0]. The first chunk must contain at least the first sentence.
-2. **PREFER LONGER CHUNKS:** If a shift occurs very early in the text window (e.g., within the first 300 words), IGNORE it unless it is a drastic scene change (e.g., a completely new chapter or a major time jump). We prefer chunks that are substantial in length.
-3. **MERGE IF POSSIBLE:** If the text flows reasonably well, even with minor topic drifts or dialogue shifts, keep it together. Only split on **major, unmistakable** boundaries.
-4. **MAJOR SHIFTS ONLY:** Look for clear, drastic boundaries (e.g., "Chapter X", "The next day...", "Meanwhile, in another city...", a complete change of characters or setting). Minor transitions do NOT warrant a split.
-5. **GROUP HEADERS:** If you see a Chapter Title, the shift starts AT the title. Select the ID of the title.
+1. **NEVER pick S0.** The first chunk must contain at least the first sentence.
+2. **Major shifts only.** Look for clear, drastic boundaries (e.g., "Chapter X", "The next day...",
+   "Meanwhile, in another city...", a complete change of characters, setting, or topic).
+   Minor transitions, dialogue beats, or small drifts do NOT warrant a split.
+3. **Prefer longer chunks.** If a possible shift occurs very early in the window, IGNORE it
+   unless it is unmistakable (e.g., a brand-new chapter title).
+4. **Group headers.** If you see a Chapter / Section title, the shift starts AT the title;
+   return the ID of the title itself.
 
-**Output Format:**
-- Return ONLY the ID of the shift point (e.g., "S 12").
-- If no significant shift occurs in this window, return "NO_SPLIT".
+**Output Format (STRICT):**
+- If shift(s) found: return ONLY the IDs, comma-separated, e.g.  `S12`  or  `S12, S37, S58`
+- If no significant shift: return exactly  `NO_SPLIT`
+- Do NOT include any other text, explanation, punctuation, or markdown.
 """
 
 
+# =====================================================================
+# 校验结果数据结构
+# =====================================================================
+@dataclass
+class BoundaryDecision:
+    """Stage 3 确定性校验的输出。"""
+    is_valid: bool
+    boundary_ids: List[int] = field(default_factory=list)  # 已校验的、按升序排列的切分点
+    raw_response: str = ""
+    reasons: List[str] = field(default_factory=list)       # 拒绝/调整的解释（用于日志）
+
+
+# =====================================================================
+# 主类
+# =====================================================================
 class LLMSemanticChunker:
     """
-    LLM-based semantic chunker using LumberChunker sentence-style approach.
-    
-    核心改进：
-    - 将文本拆为编号句子，LLM 直接返回句子 ID，避免"找不到切分句"的问题
-    - 以句子索引控制流程，逻辑清晰，不会死循环也不会越界
-    - NO_SPLIT 时继续积攒，直到 max_tokens 才强制切分（复刻 LumberChunker 动态长度）
+    ID-based deterministic semantic chunker.
+
+    设计要点：
+      - Stage 1/3/4 全程确定性，无随机性；
+      - Stage 2 是唯一可能"出错"的环节，所有结果都必须经过 Stage 3 校验；
+      - 单 ID / 多 ID / NO_SPLIT 三种 LLM 输出形式统一处理。
     """
-    
+
     def __init__(
-        self, 
+        self,
         model_type: str = "deepseek",
         model_name: str = "deepseek-chat",
-        target_chunk_tokens: int = 1000,    # 阈值：攒够多少 token 问一次 LLM
-        max_chunk_tokens: int = 2500,       # 硬上限：NO_SPLIT 时继续积攒直到此值才强制切
+        target_chunk_tokens: int = 1000,
+        max_chunk_tokens: int = 2500,
+        min_chunk_tokens: int = 200,
         max_llm_window_tokens: int = 3000,  # 保留兼容性
-        llm: BaseChatModel = None
+        llm: Optional[BaseChatModel] = None,
     ):
         self.llm = llm or create_llm(model_type=model_type, model_name=model_name, temperature=0.0)
         self.threshold = target_chunk_tokens
         self.max_tokens = max_chunk_tokens
+        self.min_tokens = min_chunk_tokens
 
-    def _get_token_count(self, text: str) -> int:
-        """简单的 token 估算（约 4 字符/token）"""
-        return len(text) // 4
+    # ------------------------------------------------------------------
+    # 工具方法
+    # ------------------------------------------------------------------
+    @staticmethod
+    def _get_token_count(text: str) -> int:
+        """简单的 token 估算（约 4 字符/token）。"""
+        return max(1, len(text) // 4)
 
-    def _split_into_sentences(self, text: str) -> List[str]:
+    # ==================================================================
+    # Stage 1 — 句子边界标定
+    # ==================================================================
+    @staticmethod
+    def _segment_sentences(text: str) -> List[str]:
         """
-        将文本拆分成句子级别的小单元。
-        使用更鲁棒的正则：先按换行拆，再按句末标点+空格拆。
-        支持：省略号(... / …)、数字开头(1. 2.)、大写字母、引号、括号。
+        基于正则切句，支持中英文标点。
+        - 英文：. ! ? … 之后接大写字母 / 数字 / 引号 / 括号
+        - 中文：。！？…… 之后直接切（中文句子不强制后面接空白）
         """
-        lines = text.split('\n')
-        sentences = []
-        for line in lines:
+        text = text.strip()
+        if not text:
+            return []
+
+        sentences: List[str] = []
+        for line in text.split("\n"):
             line = line.strip()
             if not line:
                 continue
-            # (?<=[.!?…]) 后行断言：前一个字符是句末标点（含省略号字符 …）
-            # \s+ 匹配一个或多个空白
-            # (?=[A-Z0-9"'"\u201c\u201d(\[]) 前行断言：下一个字符是大写字母、数字、引号、括号
-            parts = re.split(r'(?<=[.!?…])\s+(?=[A-Z0-9"\'"\u201c\u201d(\[])', line)
+
+            # 中英文混合切句
+            #   分隔点：
+            #     英文 — 句末标点(.!?…)后跟空白，再接大写字母/数字/引号/括号/中文字符
+            #     中文 — 句末标点(。！？……)后可有可无空白
+            pattern = (
+                r"(?<=[.!?…])\s+(?=[A-Z0-9\"'\u201c\u201d(\[\u4e00-\u9fff])"
+                r"|"
+                r"(?<=[。！？])\s*"
+            )
+            parts = re.split(pattern, line)
             for part in parts:
+                if part is None:
+                    continue
                 part = part.strip()
                 if part:
                     sentences.append(part)
+
         return sentences
 
-    def _call_llm(self, text: str) -> str:
-        """调用 LLM 判断切分点，返回 "S XX" 或 "NO_SPLIT" """
+    @staticmethod
+    def _format_numbered_window(sentences: List[str]) -> str:
+        """把窗口内的句子标上 [S0] [S1] ... 给 LLM。"""
+        return "\n".join(f"[S{i}] {s}" for i, s in enumerate(sentences))
+
+    # ==================================================================
+    # Stage 2 — LLM 决策
+    # ==================================================================
+    def _query_llm(self, numbered_text: str) -> str:
+        """调用 LLM，原样返回响应字符串（不做解析/校验）。"""
         try:
             messages = [
                 SystemMessage(content=SYSTEM_PROMPT),
-                HumanMessage(content=f"Here is the text:\n{text}")
+                HumanMessage(content=f"Here is the text:\n{numbered_text}"),
             ]
             resp = self.llm.invoke(messages)
-            return resp.content.strip()
+            return (resp.content or "").strip()
         except Exception as e:
             print(f"⚠️ LLM Error: {e}")
             return "NO_SPLIT"
 
+    # ==================================================================
+    # Stage 3 — 确定性校验
+    # ==================================================================
+    def _validate_boundary(
+        self,
+        raw_response: str,
+        buffer_sentences: List[str],
+    ) -> BoundaryDecision:
+        """
+        对 LLM 的原始输出进行严格的、与 LLM 解耦的确定性校验。
+
+        校验顺序：
+          1. NO_SPLIT 短路
+          2. 解析所有形如 `S\\d+` 的 ID（支持单 ID / 多 ID）
+          3. 范围检查：0 < id < n
+          4. 去重 + 升序
+          5. 过滤过近的边界（前缀至少 min_chunk_tokens）
+          6. 拆出超过 max_chunk_tokens 的部分时，自动回退到不超限的最大 ID
+          7. 至少保留一个有效边界，否则 is_valid=False
+        """
+        decision = BoundaryDecision(is_valid=False, raw_response=raw_response)
+        n = len(buffer_sentences)
+
+        # --- 1. NO_SPLIT 短路 ---
+        if not raw_response or "NO_SPLIT" in raw_response.upper():
+            decision.reasons.append("LLM returned NO_SPLIT (or empty)")
+            return decision
+
+        # --- 2. 抽取 ID（支持 "S12", "S 12", "S12, S37" 等形式）---
+        raw_ids = [int(m) for m in re.findall(r"S\s*(\d+)", raw_response, flags=re.IGNORECASE)]
+        if not raw_ids:
+            decision.reasons.append(f"Cannot parse any S<id> from response: '{raw_response[:80]}'")
+            return decision
+
+        # --- 3+4. 范围 / 去重 / 升序 ---
+        seen = set()
+        candidates: List[int] = []
+        for cid in raw_ids:
+            if cid <= 0:
+                decision.reasons.append(f"Drop S{cid}: cannot split at the very start")
+                continue
+            if cid >= n:
+                decision.reasons.append(f"Drop S{cid}: out of window range [0, {n})")
+                continue
+            if cid in seen:
+                continue
+            seen.add(cid)
+            candidates.append(cid)
+        candidates.sort()
+
+        if not candidates:
+            decision.reasons.append("All proposed IDs failed range check")
+            return decision
+
+        # --- 5. 最小占位（每段不少于 min_chunk_tokens）---
+        token_counts = [self._get_token_count(s) for s in buffer_sentences]
+
+        accepted: List[int] = []
+        prev_id = 0
+        running = 0  # 上一段（prev_id .. cid 之前）的 token 数
+        for cid in candidates:
+            seg_tokens = sum(token_counts[prev_id:cid])
+            if seg_tokens < self.min_tokens:
+                decision.reasons.append(
+                    f"Drop S{cid}: prefix from S{prev_id} only {seg_tokens} tokens "
+                    f"(< min {self.min_tokens})"
+                )
+                continue
+            accepted.append(cid)
+            prev_id = cid
+
+        if not accepted:
+            decision.reasons.append("All boundaries below min_chunk_tokens")
+            return decision
+
+        # --- 6. 最大占位（如果某段 > max_tokens，强制在 max 处插入额外切点）---
+        # 注意：这里只做"自动回退"——把 LLM 给出的过大段在硬上限处切开，
+        # 不改变 LLM 已选定的有效边界，只追加额外保护性边界。
+        final_ids: List[int] = []
+        prev_id = 0
+
+        def _force_split_in_range(start: int, end: int) -> List[int]:
+            """在 [start, end) 范围内，每超过 max_tokens 就强制切一刀。返回追加的边界列表。"""
+            extra: List[int] = []
+            accum = 0
+            for i in range(start, end):
+                accum += token_counts[i]
+                if accum > self.max_tokens:
+                    cut = max(start + 1, i)  # 至少切走 1 句，防死循环
+                    if cut < end and cut not in seen:
+                        extra.append(cut)
+                        seen.add(cut)
+                        accum = 0
+                        # 调整起点，避免重复触发
+                        start = cut
+            return extra
+
+        for cid in accepted:
+            forced = _force_split_in_range(prev_id, cid)
+            for f in forced:
+                if f > prev_id and f < cid:
+                    final_ids.append(f)
+                    decision.reasons.append(f"Auto-add S{f}: enforce max_chunk_tokens budget")
+            final_ids.append(cid)
+            prev_id = cid
+
+        # 处理最后一段（prev_id .. n）也可能超长，但通常由外层 max_tokens 兜底，这里不再追加。
+        final_ids = sorted(set(final_ids))
+
+        if not final_ids:
+            decision.reasons.append("No boundary survived all checks")
+            return decision
+
+        decision.is_valid = True
+        decision.boundary_ids = final_ids
+        return decision
+
+    # ==================================================================
+    # Stage 4 — 执行切分（主控循环）
+    # ==================================================================
     def split(self, text_input: Union[str, List[str]]) -> List[str]:
         """
-        使用 LumberChunker 句子版方式将文本切分为语义 chunks。
-        
-        流程：
-        1. 全文拆为句子列表
-        2. 逐句累积 buffer，达到 threshold 时问 LLM
-        3. LLM 找到切分点 → 切下 Chunk，移动指针
-        4. LLM 说 NO_SPLIT → 继续积攒，直到 max_tokens 才强制切
-        
-        Args:
-            text_input: 输入文本（字符串或段落列表）
-            
-        Returns:
-            切分后的 chunk 列表
+        主入口：将原文切为语义 chunks。
         """
-        # ========== 1. 预处理：统一转为字符串 ==========
-        if isinstance(text_input, str):
-            text = text_input.strip()
-        elif isinstance(text_input, list):
-            text = "\n\n".join(p.strip() for p in text_input if p.strip())
+        # ----- 输入归一化 -----
+        if isinstance(text_input, list):
+            text = "\n\n".join(p.strip() for p in text_input if p and p.strip())
         else:
-            text = str(text_input).strip()
+            text = (text_input or "").strip()
 
         if not text:
             print("⚠️ 输入文本为空")
             return []
 
-        # ========== 2. 拆分为句子 ==========
-        all_sentences = self._split_into_sentences(text)
-        
+        # ----- Stage 1：全文切句 -----
+        all_sentences = self._segment_sentences(text)
         if not all_sentences:
             print("⚠️ 无法从文本中提取句子")
             return [text]
-        
+
         total_tokens = self._get_token_count(text)
-        print(f"🚀 开始 Lumber 模式切分 (句子版) | 总句数: {len(all_sentences)} | "
-              f"总 tokens: ~{total_tokens} | 触发阈值: {self.threshold} tokens | "
-              f"硬上限: {self.max_tokens} tokens")
-        
-        final_chunks = []
-        
-        # chunk_start: 当前 chunk 起始句子索引
-        # cursor: 扫描指针，逐句前移
-        chunk_start = 0
-        cursor = 0
-        buffer_tokens = 0            # 从 chunk_start 到 cursor 的累积 token 数
-        next_ask_tokens = self.threshold  # 下次问 LLM 的 token 门槛
-        
+        print(
+            f"🚀 ID-based 切分开始 | 总句数: {len(all_sentences)} | "
+            f"总 tokens ≈ {total_tokens} | 阈值: {self.threshold} | "
+            f"硬上限: {self.max_tokens} | 最小段: {self.min_tokens}"
+        )
+
+        final_chunks: List[str] = []
+
+        chunk_start = 0                       # 当前 chunk 起点（句子索引）
+        cursor = 0                            # 扫描指针
+        buffer_tokens = 0                     # chunk_start..cursor 累积 token
+        next_ask_tokens = self.threshold      # 下次询问 LLM 的门槛
+
         while cursor < len(all_sentences):
-            # ========== 3. 逐句积攒 ==========
+            # 逐句积攒
             buffer_tokens += self._get_token_count(all_sentences[cursor])
             cursor += 1
-            
-            # 还没到门槛，继续积攒
+
+            # 还没到询问门槛 → 继续积攒
             if buffer_tokens < next_ask_tokens and cursor < len(all_sentences):
                 continue
-            
-            # 到达文末或到达门槛 —— 需要做决策
-            buffer_sentences = all_sentences[chunk_start : cursor]
-            
-            # 如果是文末且量太少（< 50% threshold），直接归档不问 LLM
+
+            buffer_sentences = all_sentences[chunk_start:cursor]
+
+            # 文末且量太少 → 直接归档不问 LLM
             if cursor >= len(all_sentences) and buffer_tokens < self.threshold * 0.5:
-                chunk_text = " ".join(buffer_sentences)
-                if chunk_text.strip():
-                    final_chunks.append(chunk_text.strip())
-                    print(f"📝 最后剩余归档为 Chunk {len(final_chunks)} "
-                          f"({self._get_token_count(chunk_text)} tokens)")
+                tail_text = " ".join(buffer_sentences).strip()
+                if tail_text:
+                    final_chunks.append(tail_text)
+                    print(
+                        f"📝 文末归档 Chunk {len(final_chunks)} "
+                        f"(~{self._get_token_count(tail_text)} tokens)"
+                    )
                 break
-            
-            # ========== 4. 构建带 ID 的文本给 LLM ==========
-            numbered_text = "\n".join([f"[S {i}] {s}" for i, s in enumerate(buffer_sentences)])
-            
-            # ========== 5. 询问 LLM ==========
-            decision = self._call_llm(numbered_text)
-            
-            if "NO_SPLIT" in decision:
-                # ===== NO_SPLIT 逻辑（复刻 LumberChunker 动态长度）=====
+
+            # ----- Stage 2：LLM 决策（局部 ID）-----
+            numbered_text = self._format_numbered_window(buffer_sentences)
+            raw_response = self._query_llm(numbered_text)
+
+            # ----- Stage 3：确定性校验 -----
+            decision = self._validate_boundary(raw_response, buffer_sentences)
+
+            if not decision.is_valid:
+                # ===== 等同 NO_SPLIT：继续积攒或在硬上限处强切 =====
+                reason_brief = "; ".join(decision.reasons[:2]) if decision.reasons else "no reason"
                 if buffer_tokens >= self.max_tokens or cursor >= len(all_sentences):
-                    # 已到硬上限或文末：强制归档整个 buffer
-                    chunk_text = " ".join(buffer_sentences)
-                    if chunk_text.strip():
-                        final_chunks.append(chunk_text.strip())
-                        reason = "硬上限" if buffer_tokens >= self.max_tokens else "文末"
-                        print(f"⚠️ NO_SPLIT 且达到{reason} ({buffer_tokens} tokens) -> "
-                              f"强制归档 Chunk {len(final_chunks)} ({len(buffer_sentences)} 句)")
-                    # 重置
+                    chunk_text = " ".join(buffer_sentences).strip()
+                    if chunk_text:
+                        final_chunks.append(chunk_text)
+                        cause = "硬上限" if buffer_tokens >= self.max_tokens else "文末"
+                        print(
+                            f"⚠️ 校验未通过且达到{cause} ({buffer_tokens} tokens, {reason_brief}) "
+                            f"-> 强制归档 Chunk {len(final_chunks)} ({len(buffer_sentences)} 句)"
+                        )
                     chunk_start = cursor
                     buffer_tokens = 0
                     next_ask_tokens = self.threshold
                 else:
-                    # 还有空间 → 继续积攒，下次多攒一些再问
                     increment = max(self.threshold // 2, 300)
                     next_ask_tokens = buffer_tokens + increment
-                    print(f"💡 NO_SPLIT ({buffer_tokens} tokens)，继续积攒到 {next_ask_tokens} tokens...")
-                    # 不切分，不移动 chunk_start，继续外层 while 循环
-            else:
-                # ===== 有切分点 =====
-                match = re.search(r"S\s*(\d+)", decision)
-                if match:
-                    split_offset = int(match.group(1))
-                    print(f"✂️  LLM 决定在局部 ID [S {split_offset}] 处切分")
-                else:
-                    # 解析失败 → 归档整个窗口
-                    split_offset = len(buffer_sentences)
-                    print(f"⚠️ 无法解析 LLM 输出 '{decision[:80]}'，将窗口全部归档")
-                
-                # 边界检查
-                if split_offset <= 0:
-                    split_offset = 1  # 至少切一句，防止死循环
-                if split_offset > len(buffer_sentences):
-                    split_offset = len(buffer_sentences)
-                
-                # 生成 Chunk：chunk_start 到 chunk_start + split_offset
-                chunk_sents = all_sentences[chunk_start : chunk_start + split_offset]
-                chunk_text = " ".join(chunk_sents)
-                if chunk_text.strip():
-                    final_chunks.append(chunk_text.strip())
-                    print(f"✅ 生成 Chunk {len(final_chunks)}: "
-                          f"{self._get_token_count(chunk_text)} tokens, "
-                          f"{split_offset} 句")
-                
-                # 移动 chunk_start 到切分点
-                chunk_start += split_offset
-                # 重要：cursor 回退到 chunk_start，重新从新 chunk 开始积攒
-                cursor = chunk_start
-                buffer_tokens = 0
-                next_ask_tokens = self.threshold
-        
-        # ========== 处理最后可能遗漏的 buffer ==========
+                    print(
+                        f"💡 校验未通过 ({reason_brief})，buffer={buffer_tokens} tokens，"
+                        f"继续积攒到 {next_ask_tokens} tokens"
+                    )
+                continue
+
+            # ----- Stage 4：按已校验 ID 切分 -----
+            print(
+                f"✂️  LLM→ '{raw_response[:60]}'  →  校验通过边界(局部): "
+                f"{['S' + str(i) for i in decision.boundary_ids]}"
+            )
+
+            # 多 ID 一次切多段（前 N-1 个全部归档，最后一个作为新的 chunk_start）
+            prev_local = 0
+            for local_id in decision.boundary_ids:
+                seg_sents = buffer_sentences[prev_local:local_id]
+                seg_text = " ".join(seg_sents).strip()
+                if seg_text:
+                    final_chunks.append(seg_text)
+                    print(
+                        f"   ✅ Chunk {len(final_chunks)}: "
+                        f"~{self._get_token_count(seg_text)} tokens, {len(seg_sents)} 句"
+                    )
+                prev_local = local_id
+
+            # 把 chunk_start 推进到最后一个边界对应的全局位置
+            new_global_start = chunk_start + decision.boundary_ids[-1]
+            chunk_start = new_global_start
+            cursor = chunk_start            # 重新从切分点之后开始积攒
+            buffer_tokens = 0
+            next_ask_tokens = self.threshold
+
+        # ----- 收尾：剩余 buffer 归档 -----
         if chunk_start < len(all_sentences):
-            remaining_sents = all_sentences[chunk_start:]
-            chunk_text = " ".join(remaining_sents)
-            if chunk_text.strip():
-                final_chunks.append(chunk_text.strip())
-                print(f"📝 保存最后一个 Chunk {len(final_chunks)} "
-                      f"({self._get_token_count(chunk_text)} tokens)")
-        
-        # ========== 安全检查 ==========
+            tail_text = " ".join(all_sentences[chunk_start:]).strip()
+            if tail_text:
+                final_chunks.append(tail_text)
+                print(
+                    f"📝 收尾 Chunk {len(final_chunks)} "
+                    f"(~{self._get_token_count(tail_text)} tokens)"
+                )
+
         if not final_chunks:
-            print(f"⚠️ 未生成任何 chunks，返回原始文本")
+            print("⚠️ 未生成任何 chunks，返回原始文本")
             final_chunks = [text]
-        
-        print(f"✅ Lumber 句子版切分完成，共生成 {len(final_chunks)} 个 chunks")
+
+        print(f"✅ 切分完成，共 {len(final_chunks)} 个 chunks")
         return final_chunks
 
 
-# ================= 测试 =================
+# =====================================================================
+# 测试
+# =====================================================================
 if __name__ == "__main__":
-    # 模拟：标题 + 正文 + 新标题 + 正文
-    text = "Chapter 1: The Beginning. "
-    text += "This is sentence one. " * 50  # 50句
-    text += "Chapter 2: The Middle. "  # 应该是切分点
-    text += "This is sentence two. " * 60
-    
-    splitter = LLMSemanticChunker(target_chunk_tokens=500)  # 设小点方便测
-    chunks = splitter.split(text)
-    
+    sample = "Chapter 1: The Beginning. "
+    sample += "This is sentence one. " * 50
+    sample += "Chapter 2: The Middle. "
+    sample += "This is sentence two. " * 60
+
+    splitter = LLMSemanticChunker(target_chunk_tokens=500)
+    chunks = splitter.split(sample)
     for i, c in enumerate(chunks):
-        print(f"\nChunk {i+1}:\n{c[:100]}...")
+        print(f"\nChunk {i + 1}:\n{c[:120]}...")

@@ -6,12 +6,12 @@ import uuid
 from pathlib import Path
 
 # Ensure project root is in path for imports
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from agents.inspector import InspectorAgent
 from agents.llm_factory import create_llm
 from core.types import RoutingPath
-from core.sir import SIRBuilder, SIRNode
+from core.sir import SIRBuilder
 from agents.refiner import RefinerAgent
 from processing.semantic_processor import LongformerSemanticSplitter
 from processing.structural_processor import StructuralRuleProcessor

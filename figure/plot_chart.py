@@ -19,7 +19,7 @@ plt.rcParams.update({
 
 def plot_vertical_bar_with_top_left_box():
     labels_short = ["Lumber", "Topo-S", "Topo-C", "Topo-A"]
-    values = [16500, 5000, 18800, 10520]
+    values = [16500, 8500, 18800, 12620]
 
     C_GREEN  = "#8AD46A"
     C_BLUE   = "#43B5E6"

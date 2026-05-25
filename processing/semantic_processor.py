@@ -12,7 +12,7 @@ from .base import BaseTopologyProcessor
 
 class LongformerSemanticSplitter:
     """
-    Revised Semantic Splitter implementing HiChunk-style Iterative Inference.
+    Revised Semantic Splitter implementing Iterative Inference.
     Features:
     - Global Context Awareness
     - Strict Token-level Length Control
@@ -21,7 +21,7 @@ class LongformerSemanticSplitter:
     
     def __init__(
         self, 
-        model_path: str = "/root/liushifu/TopoChunker/models/longformer-segmenter-finetuned/checkpoint-3159",
+        model_path: str = "/root/liushifu/TopoChunker/models/longformer",
         target_chunk_size: int = 500,
         max_chunk_size: int = 512,
         threshold: float = 0.5
@@ -170,7 +170,7 @@ class LongformerSemanticSplitter:
         chunks = []
         start = 1
         current_count = 0
-
+        
         # Loop range: 1 to len-1 (Excluding CLS and SEP)
         for i in range(1, len(input_ids) - 1):
             current_count += 1
