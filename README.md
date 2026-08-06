@@ -40,15 +40,9 @@ The `SEMANTIC_FLOW` route loads a fine-tuned Longformer segmenter for semantic b
 Download:
 
 ```bash
-# Option A: project script (writes to models/longformer)
-python models/download.py
-
-# Option B: huggingface-cli
-huggingface-cli download Theoreticallyhugo/longformer-sep_tok_full_labels \
-  --include "checkpoint-3159/*" \
-  --local-dir models/.longformer_download
-mv models/.longformer_download/checkpoint-3159 models/longformer
-rm -rf models/.longformer_download
+# huggingface-cli
+huggingface-cli download Theoreticallyhugo/longformer-sep_tok_full_labels 
+  
 ```
 
 ## Configuration
