@@ -1,5 +1,4 @@
 import re
-import json
 import fitz  # PyMuPDF
 from pathlib import Path
 from typing import List, Dict

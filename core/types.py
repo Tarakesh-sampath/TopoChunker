@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from enum import Enum
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List
 
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -33,14 +33,3 @@ class Blueprint(BaseModel):
     confidence_score: float = Field(ge=0.0, le=1.0)
     risk_assessment: RiskProfile
     execution_plan: Dict[str, Any] | str
-
-
-class DocumentSIR(BaseModel):
-    """Shared Information Repository (Blackboard) container."""
-
-    model_config = ConfigDict(extra="forbid", validate_assignment=True)
-
-    raw_data: Optional[str] = None
-    metadata: Dict[str, Any] = Field(default_factory=dict)
-    blueprint: Optional[Blueprint] = None
-    topology_graph: Optional[Dict[str, Any]] = None

@@ -1,8 +1,8 @@
 import json
 import re
-from typing import Annotated, Dict, List, Literal, TypedDict, Union
+from typing import Annotated, Dict, List, Literal, TypedDict
 
-from langchain_core.messages import BaseMessage, HumanMessage, SystemMessage, AIMessage, ToolMessage
+from langchain_core.messages import BaseMessage, HumanMessage, SystemMessage, ToolMessage
 from langchain_core.language_models import BaseChatModel
 from langgraph.graph import END, StateGraph
 from langgraph.graph.message import add_messages
@@ -15,7 +15,6 @@ class AgentState(TypedDict):
     messages: Annotated[List[BaseMessage], add_messages]
     file_path: str
     iteration_count: int
-    observations: List[str]
     meta_info: Dict
     complexity_score: float
     rule_adherence_score: float
@@ -195,7 +194,6 @@ Return JSON:
             "messages": [],
             "file_path": file_path,
             "iteration_count": 0,
-            "observations": [],
             "meta_info": {},
             "complexity_score": 0.0,
             "rule_adherence_score": 0.0,

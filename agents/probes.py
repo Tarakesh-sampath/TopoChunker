@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import random
 import re
-from typing import Dict, List, Tuple
+from typing import Dict, List
 
 # Lazy import for PyMuPDF
 try:
@@ -92,7 +92,6 @@ class MetaReader:
             if verbose:
                 print(f"  [扫描检测] 开始检查文档，总页数: {doc.page_count}，检查前 {pages_to_check} 页")
             
-            page_details = []
             for page_idx in range(pages_to_check):
                 page = doc.load_page(page_idx)
                 
@@ -106,12 +105,6 @@ class MetaReader:
                 text_blocks = [b for b in text_dict.get("blocks", []) if b.get("type") == 0]
                 block_count = len(text_blocks)
                 total_text_blocks += block_count
-                
-                page_details.append({
-                    "page": page_idx + 1,
-                    "text_length": text_length,
-                    "block_count": block_count,
-                })
                 
                 if verbose:
                     print(f"    - 第 {page_idx + 1} 页: 文本长度={text_length} 字符, 文本块={block_count} 个")

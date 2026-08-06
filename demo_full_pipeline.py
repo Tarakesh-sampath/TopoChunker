@@ -51,7 +51,7 @@ def main() -> None:
     if blueprint.selected_path == RoutingPath.STRUCTURAL_RULE:
         processor = StructuralRuleProcessor()
     elif blueprint.selected_path == RoutingPath.SEMANTIC_FLOW:
-        processor = SemanticFlowProcessor(llm_client=llm_instance)
+        processor = SemanticFlowProcessor()
     else:
         processor = VisualTopologyProcessor()
 

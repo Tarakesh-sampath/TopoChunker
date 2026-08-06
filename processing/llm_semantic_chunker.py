@@ -92,7 +92,6 @@ class LLMSemanticChunker:
         target_chunk_tokens: int = 1000,
         max_chunk_tokens: int = 2500,
         min_chunk_tokens: int = 200,
-        max_llm_window_tokens: int = 3000,  # 保留兼容性
         llm: Optional[BaseChatModel] = None,
     ):
         self.llm = llm or create_llm(model_type=model_type, model_name=model_name, temperature=0.0)
@@ -227,7 +226,6 @@ class LLMSemanticChunker:
 
         accepted: List[int] = []
         prev_id = 0
-        running = 0  # 上一段（prev_id .. cid 之前）的 token 数
         for cid in candidates:
             seg_tokens = sum(token_counts[prev_id:cid])
             if seg_tokens < self.min_tokens:

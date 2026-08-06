@@ -1,13 +1,11 @@
 import re
 import json
 import torch
-import gc
 import numpy as np
 import fitz  # PyMuPDF
 from pathlib import Path
 from typing import List, Tuple, Union
 from transformers import LongformerForTokenClassification, LongformerTokenizerFast
-from langchain_core.language_models import BaseChatModel
 from .base import BaseTopologyProcessor
 
 class LongformerSemanticSplitter:
@@ -223,7 +221,7 @@ class LongformerSemanticSplitter:
         return len(self.tokenizer.encode(text, add_special_tokens=False))
 
 class SemanticFlowProcessor(BaseTopologyProcessor):
-    def __init__(self, llm_client: BaseChatModel):
+    def __init__(self):
         self.splitter = LongformerSemanticSplitter()
 
     def process(self, file_path: str) -> str:

@@ -1,6 +1,6 @@
 import json
 import re
-from typing import Annotated, Dict, List, Literal, TypedDict, Union
+from typing import Annotated, Dict, List, Literal, TypedDict
 
 from langchain_core.messages import BaseMessage, HumanMessage, SystemMessage, AIMessage, ToolMessage
 from langchain_core.language_models import BaseChatModel
@@ -13,10 +13,8 @@ from .refiner_tools import get_refiner_tools
 class RefinerState(TypedDict):
     messages: Annotated[List[BaseMessage], add_messages]
     root_node_id: str
-    final_chunks: List[str]
     iteration_count: int
     validation_errors: List[str]
-    query: str  # Added query to state
     consecutive_tool_errors: int  # 连续 tool_calls 错误计数
 
 class RefinerAgent:
@@ -26,9 +24,7 @@ class RefinerAgent:
         self.node_registry = node_registry
         self.verbose = verbose
         
-        # --- 优化 A: 预初始化工具并绑定 LLM，避免每轮重复开销 ---
         self.tools = get_refiner_tools(self.node_registry, self.splitter_func, llm=self.base_llm)
-        self.llm_with_tools = self.base_llm.bind_tools(self.tools)
         
         self.workflow = self._build_workflow()
     
@@ -569,7 +565,7 @@ Current Node ID: `{root_node.node_id}`
                 
         return "continue"
 
-    def refine(self, root_node: SIRNode, query: str = "") -> List[str]:
+    def refine(self, root_node: SIRNode) -> List[str]:
         """递归精炼：将大任务拆解为小任务"""
         
         # --- 策略 1: 结构化递归 (Python 驱动) ---
@@ -581,7 +577,7 @@ Current Node ID: `{root_node.node_id}`
                 print(f"分而治之 📂: Section '{root_node.path_str}' is large ({root_node.total_tree_token} tokens) and has sub-headings. Splitting by children.")
             all_sub_chunks = []
             for child in root_node.children:
-                all_sub_chunks.extend(self.refine(child, query=query))
+                all_sub_chunks.extend(self.refine(child))
             return all_sub_chunks
 
         # --- 优化策略: 快车道 (Fast Path) ---
@@ -599,10 +595,8 @@ Current Node ID: `{root_node.node_id}`
         initial_state = {
             "messages": [],
             "root_node_id": root_node.node_id,
-            "final_chunks": [],
             "iteration_count": 0,
             "validation_errors": [],
-            "query": query,
             "consecutive_tool_errors": 0
         }
         final_state = self.workflow.invoke(initial_state)

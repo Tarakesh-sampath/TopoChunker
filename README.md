@@ -1,62 +1,59 @@
 # TopoChunker
-[![arXiv](https://img.shields.io/badge/arXiv-2401.01234-B31B1B.svg)]([https://arxiv.org/abs/2401.01234](https://arxiv.org/abs/2603.18409))
 
-TopoChunker is a multi-stage PDF-to-knowledge pipeline for producing topology-aware, retrieval-friendly chunks.
+[![arXiv](https://img.shields.io/badge/arXiv-2603.18409-B31B1B.svg)](https://arxiv.org/abs/2603.18409)
+[![License](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](LICENSE)
 
-## Overview
+Topology-aware agentic document chunking for retrieval-augmented generation (RAG).
 
-The pipeline has four phases:
+TopoChunker routes each PDF by layout complexity, maps it onto a Structured Intermediate Representation (SIR), and assembles self-contained, retrieval-ready chunks.
 
-1. **Perception (Inspector Agent)**  
-   Analyze PDF characteristics (scan state, layout complexity, structural regularity) and choose a routing path.
-2. **Execution (Processor Routing)**  
-   Route the document to one of:
-   - `STRUCTURAL_RULE`
-   - `SEMANTIC_FLOW`
-   - `VISUAL_TOPOLOGY`
-3. **Modeling (SIR Construction)**  
-   Build a hierarchical SIR graph from generated markdown.
-4. **Assembly (Refiner Agent)**  
-   Apply the refinement toolkit:
-   - `SIR_Query`
-   - `Semantic_Slicer`
-   - `Chunk_Enhancer`
-   to produce final JSONL chunks for RAG.
+## Pipeline
 
-## Repository Structure
+```
+PDF → Inspector → Processor → SIR Graph → Refiner → JSONL Chunks
+```
 
-Key directories/files:
+| Stage | Component | Role |
+|-------|-----------|------|
+| Perception | Inspector Agent | Assess layout / scan quality and select a routing path |
+| Execution | Processor | `STRUCTURAL_RULE` · `SEMANTIC_FLOW` · `VISUAL_TOPOLOGY` |
+| Modeling | SIR Builder | Construct a hierarchical topology graph from markdown |
+| Assembly | Refiner Agent | Slice, enrich, and emit final chunks (`SIR_Query`, `Semantic_Slicer`, `Chunk_Enhancer`) |
 
-- `demo_full_pipeline.py`: End-to-end entrypoint
-- `agents/`: Inspector + Refiner agents and tools
-- `processing/`: Structural / semantic / visual processing modules
-- `core/`: Core data models (`SIR`, `Blueprint`, routing types)
-- `config/llm_config.example.json`: Local API config example
-- `requirements.txt`: Python dependencies
-- `outputs/`: Runtime outputs (created automatically)
-- `Evaluation/`: Evaluation scripts and experiment artifacts
-
-## Requirements
-
-- Python 3.10+ (recommended)
-- API key for at least one provider:
-  - DeepSeek (`DEEPSEEK_API_KEY`) or
-  - OpenAI (`OPENAI_API_KEY`)
-
-Install dependencies:
+## Installation
 
 ```bash
 pip install -r requirements.txt
 ```
 
+Requires **Python 3.10+** and an API key for DeepSeek or OpenAI.
+
+## Local Models
+
+The `SEMANTIC_FLOW` route loads a fine-tuned Longformer segmenter for semantic boundary detection.
+
+| Item | Value |
+|------|-------|
+| Hugging Face | [`Theoreticallyhugo/longformer-sep_tok_full_labels`](https://huggingface.co/Theoreticallyhugo/longformer-sep_tok_full_labels) (`checkpoint-3159`) |
+| Local path | `models/longformer` |
+
+Download:
+
+```bash
+# Option A: project script (writes to models/longformer)
+python models/download.py
+
+# Option B: huggingface-cli
+huggingface-cli download Theoreticallyhugo/longformer-sep_tok_full_labels \
+  --include "checkpoint-3159/*" \
+  --local-dir models/.longformer_download
+mv models/.longformer_download/checkpoint-3159 models/longformer
+rm -rf models/.longformer_download
+```
+
 ## Configuration
 
-You can configure credentials in either way:
-
-1. **Environment variables** (recommended for quick run)
-2. **Local config file** `config/llm_config.json` (copy from `config/llm_config.example.json`)
-
-Example env setup:
+Set credentials via environment variables (recommended):
 
 ```bash
 export DEEPSEEK_API_KEY="your_key"
@@ -64,52 +61,63 @@ export DEEPSEEK_API_KEY="your_key"
 export DEEPSEEK_BASE_URL="https://api.deepseek.com"
 ```
 
-## Quick Start
+Or copy `config/llm_config.example.json` to `config/llm_config.json` and fill in your keys.
 
-Run the full pipeline on a PDF:
+## Usage
 
 ```bash
-python demo_full_pipeline.py "/absolute/path/to/your.pdf"
+python demo_full_pipeline.py /path/to/document.pdf
 ```
 
 Optional arguments:
 
 ```bash
-python demo_full_pipeline.py "/absolute/path/to/your.pdf" \
+python demo_full_pipeline.py /path/to/document.pdf \
   --provider deepseek \
   --model deepseek-chat \
   --temp 0.1
 ```
 
-Supported providers:
-- `--provider deepseek` (default)
-- `--provider openai`
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--provider` | `deepseek` | `deepseek` or `openai` |
+| `--model` | `deepseek-chat` | Model name |
+| `--temp` | `0.1` | Sampling temperature |
 
 ## Outputs
 
-For input `example.pdf`, outputs are written to:
+Results are written to `outputs/<pdf_stem>/`:
 
-`outputs/example/`
+| File | Description |
+|------|-------------|
+| `final_knowledge_base.jsonl` | Final retrieval chunks |
+| `topology_sir.json` | Serialized SIR tree |
+| `topology_graph.mmd` | Mermaid visualization of the topology |
 
-Main artifacts:
+## Project Layout
 
-- `final_knowledge_base.jsonl` (final chunked corpus for retrieval)
-- `topology_sir.json` (serialized SIR tree)
-- `topology_graph.mmd` (Mermaid graph for visualization)
+```
+TopoChunker/
+├── demo_full_pipeline.py   # End-to-end entry point
+├── agents/                 # Inspector & Refiner agents
+├── processing/             # Structural / semantic / visual processors
+├── core/                   # SIR models and routing types
+├── config/                 # LLM config template
+├── Evaluation/             # Evaluation scripts
+└── requirements.txt
+```
 
-## Notes
+## Citation
 
-- Large nodes are refined with `Semantic_Slicer` and `Chunk_Enhancer`.
-- Context disambiguation relies on `SIR_Query` lineage + sibling evidence.
-- The pipeline logs each phase in stdout for traceability.
-
-## Troubleshooting
-
-- **File not found**: use an absolute path for `pdf_path`.
-- **API key error**: ensure provider key is available in env/config.
-- **PyMuPDF error**: reinstall `pymupdf` from `requirements.txt`.
-- **Model loading issues (semantic splitter)**: verify local model files/dependencies under `processing/semantic_processor.py`.
+```bibtex
+@article{liu2026topochunker,
+  title   = {TopoChunker: Topology-Aware Agentic Document Chunking Framework},
+  author  = {Liu, Xiaoyu},
+  journal = {arXiv preprint arXiv:2603.18409},
+  year    = {2026}
+}
+```
 
 ## License
 
-This project is licensed under the [MIT License](LICENSE) - see the LICENSE file for details.
+Apache License 2.0. See [LICENSE](LICENSE) for details.

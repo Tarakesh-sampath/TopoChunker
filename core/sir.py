@@ -1,6 +1,5 @@
 import uuid
 import re
-import json
 from dataclasses import dataclass, field
 from typing import List, Optional, Dict, Any
 
@@ -20,13 +19,11 @@ class SIRNode:
     parent: Optional['SIRNode'] = field(default=None, repr=False)
     children: List['SIRNode'] = field(default_factory=list, repr=False)
     prev_sibling: Optional['SIRNode'] = field(default=None, repr=False)
-    next_sibling: Optional['SIRNode'] = field(default=None, repr=False)
     
     # --- Enhanced Attributes ---
     path_str: str = ""        # Breadcrumb path: "path1.pdf > Chapter 1 > Section 1.1"
     token_count: int = 0      # Node's own token count
     total_tree_token: int = 0 # sum(tokens of self + descendants)
-    is_atomic: bool = False   # True if node shouldn't be split (table/image/code)
     metadata: Dict[str, Any] = field(default_factory=dict) # [New] Extra metadata (doc_name, page, etc.)
     
     def __repr__(self):
@@ -43,7 +40,6 @@ class SIRNode:
             "path_str": self.path_str,
             "token_count": self.token_count,
             "total_tree_token": self.total_tree_token,
-            "is_atomic": self.is_atomic,
             "metadata": self.metadata,
             "parent_id": self.parent.node_id if self.parent else None,
         }
@@ -129,7 +125,6 @@ class SIRBuilder:
             
             # --- Calculation (Deterministic Decorator) ---
             node.token_count = self._count_tokens(content)
-            node.is_atomic = self._check_atomicity(content, node_type)
             
             # Path inheritance: Always starts with filename
             if node_type == 'heading':
@@ -140,11 +135,8 @@ class SIRBuilder:
             # 4. Linkage
             parent.children.append(node)
             
-            # Sibling linkage
+            # Sibling linkage (linear sequence for context flow)
             if self.last_node:
-                # Strictly speaking, siblings are nodes with the same parent
-                # but we keep a linear sequence for context flow
-                self.last_node.next_sibling = node
                 node.prev_sibling = self.last_node
             
             self.last_node = node
@@ -205,15 +197,6 @@ class SIRBuilder:
         # Fallback: Simple heuristic (CJK characters + whitespace split)
         # Roughly 1 token per 1.5 chars for mixed text
         return len(text.split()) + len(re.findall(r'[\u4e00-\u9fff]', text))
-
-    def _check_atomicity(self, content: str, node_type: str) -> bool:
-        if node_type in ['table', 'code', 'image']:
-            return True
-        if re.search(r'!\[.*?\]\(.*?\)', content): # Image tag
-            return True
-        if len(content) < 50:
-            return False
-        return False
 
     def _aggregate_tokens(self, node: SIRNode) -> int:
         node.total_tree_token = node.token_count
