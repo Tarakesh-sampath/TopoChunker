@@ -1,8 +1,8 @@
 # TopoChunker
-
-
 [![arXiv](https://img.shields.io/badge/arXiv-2401.01234-B31B1B.svg)]([https://arxiv.org/abs/2401.01234](https://arxiv.org/abs/2603.18409))
+
 TopoChunker is a multi-stage PDF-to-knowledge pipeline for producing topology-aware, retrieval-friendly chunks.
+
 ## Overview
 
 The pipeline has four phases:
