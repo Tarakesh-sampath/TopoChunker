@@ -42,7 +42,6 @@ Download:
 ```bash
 # huggingface-cli
 huggingface-cli download Theoreticallyhugo/longformer-sep_tok_full_labels 
-  
 ```
 
 ## Configuration
